@@ -296,6 +296,7 @@ pub enum EventKind {
     RemoveRecentStickerUpdate,
     FavoritesUpdate,
     StatusPrivacyUpdate,
+    UnarchiveChatsSettingUpdate,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -309,7 +310,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::StatusPrivacyUpdate as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::UnarchiveChatsSettingUpdate as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1225,6 +1226,10 @@ pub enum Event {
     /// variant index, so inserting in the middle renumbers everything after it.
     FavoritesUpdate(FavoritesUpdate),
     StatusPrivacyUpdate(StatusPrivacyUpdate),
+
+    /// The account-wide "unarchive chats" setting changed on a linked device
+    /// (`setting_unarchiveChats`, `UnarchiveChatsSetting.unarchiveChats`).
+    UnarchiveChatsSettingUpdate(UnarchiveChatsSettingUpdate),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1326,6 +1331,7 @@ impl Event {
             Event::RemoveRecentStickerUpdate(_) => EventKind::RemoveRecentStickerUpdate,
             Event::FavoritesUpdate(_) => EventKind::FavoritesUpdate,
             Event::StatusPrivacyUpdate(_) => EventKind::StatusPrivacyUpdate,
+            Event::UnarchiveChatsSettingUpdate(_) => EventKind::UnarchiveChatsSettingUpdate,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -2816,6 +2822,20 @@ pub struct DisableLinkPreviewsUpdate {
     pub from_full_sync: bool,
 }
 
+/// The account-wide "unarchive chats" setting changed on a linked device
+/// (`setting_unarchiveChats`).
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct UnarchiveChatsSettingUpdate {
+    /// `true` when chats should automatically unarchive on receiving new messages.
+    /// Only emitted when the wire carried the flag; WA Web treats an absent one as
+    /// a malformed mutation.
+    pub unarchive_chats: bool,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::UnarchiveChatsSetting>,
+    pub from_full_sync: bool,
+}
+
 /// A saved contact was deleted on a linked device.
 ///
 /// Carries no action payload: the mutation is a syncd `Remove`, and WA Web's
@@ -2914,6 +2934,7 @@ mod tests {
         assert_eq!(EventKind::RemoveRecentStickerUpdate as u8, 73);
         assert_eq!(EventKind::FavoritesUpdate as u8, 74);
         assert_eq!(EventKind::StatusPrivacyUpdate as u8, 75);
+        assert_eq!(EventKind::UnarchiveChatsSettingUpdate as u8, 76);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted

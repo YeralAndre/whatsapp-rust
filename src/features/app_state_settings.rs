@@ -6,6 +6,8 @@
 //!
 //! - `setting_disableLinkPreviews` (index `["setting_disableLinkPreviews"]`,
 //!   `regular`) -> `PrivacySettingDisableLinkPreviewsAction`
+//! - `setting_unarchiveChats` (index `["setting_unarchiveChats"]`,
+//!   `regular_low`) -> `UnarchiveChatsSetting`
 
 use crate::appstate_sync::Mutation;
 use crate::client::AppStateDispatchOutcome;
@@ -13,7 +15,7 @@ use crate::client::Client;
 use crate::features::chat_actions::AppStateError;
 use log::debug;
 use wacore::appstate::schemas;
-use wacore::types::events::{DisableLinkPreviewsUpdate, Event};
+use wacore::types::events::{DisableLinkPreviewsUpdate, Event, UnarchiveChatsSettingUpdate};
 use waproto::whatsapp as wa;
 
 /// Dispatch inbound syncd setting mutations synced from a linked device,
@@ -24,11 +26,14 @@ pub(crate) fn dispatch_app_state_setting_mutation_outcome(
     m: &mut Mutation,
     event_full_sync: bool,
 ) -> AppStateDispatchOutcome {
-    if m.operation != wa::syncd_mutation::SyncdOperation::Set
-        || m.index.first().map(String::as_str) != Some(schemas::DISABLE_LINK_PREVIEWS.name)
-    {
+    if m.operation != wa::syncd_mutation::SyncdOperation::Set {
         return AppStateDispatchOutcome::Unclaimed;
     }
+
+    let name = match m.index.first().map(String::as_str) {
+        Some(name) => name,
+        None => return AppStateDispatchOutcome::Unclaimed,
+    };
 
     let ts = m
         .action_value
@@ -37,25 +42,46 @@ pub(crate) fn dispatch_app_state_setting_mutation_outcome(
         .unwrap_or(0);
     let time = wacore::time::from_millis_or_now(ts);
 
-    // WA Web counts a mutation whose `isPreviewsDisabled` is absent as a
-    // malformed action value and applies nothing, so there is no flag to report.
-    if let Some(val) = &mut m.action_value
-        && let Some(act) = val.privacy_setting_disable_link_previews_action.take()
-        && let Some(disabled) = act.is_previews_disabled
-    {
-        event_bus.dispatch(Event::DisableLinkPreviewsUpdate(
-            DisableLinkPreviewsUpdate::builder()
-                .previews_disabled(disabled)
-                .timestamp(time)
-                .action(Box::new(act))
-                .from_full_sync(event_full_sync)
-                .build(),
-        ));
-        AppStateDispatchOutcome::Event("DisableLinkPreviewsUpdate")
+    if name == schemas::DISABLE_LINK_PREVIEWS.name {
+        // WA Web counts a mutation whose `isPreviewsDisabled` is absent as a
+        // malformed action value and applies nothing, so there is no flag to report.
+        if let Some(val) = &mut m.action_value
+            && let Some(act) = val.privacy_setting_disable_link_previews_action.take()
+            && let Some(disabled) = act.is_previews_disabled
+        {
+            event_bus.dispatch(Event::DisableLinkPreviewsUpdate(
+                DisableLinkPreviewsUpdate::builder()
+                    .previews_disabled(disabled)
+                    .timestamp(time)
+                    .action(Box::new(act))
+                    .from_full_sync(event_full_sync)
+                    .build(),
+            ));
+            AppStateDispatchOutcome::Event("DisableLinkPreviewsUpdate")
+        } else {
+            // Warned once centrally by `report` (see above); logging here too
+            // would emit the same fact twice.
+            AppStateDispatchOutcome::Malformed("DisableLinkPreviewsUpdate")
+        }
+    } else if name == schemas::UNARCHIVE_CHATS_SETTING.name {
+        if let Some(val) = &mut m.action_value
+            && let Some(act) = val.unarchive_chats_setting.take()
+            && let Some(unarchive) = act.unarchive_chats
+        {
+            event_bus.dispatch(Event::UnarchiveChatsSettingUpdate(
+                UnarchiveChatsSettingUpdate::builder()
+                    .unarchive_chats(unarchive)
+                    .timestamp(time)
+                    .action(Box::new(act))
+                    .from_full_sync(event_full_sync)
+                    .build(),
+            ));
+            AppStateDispatchOutcome::Event("UnarchiveChatsSettingUpdate")
+        } else {
+            AppStateDispatchOutcome::Malformed("UnarchiveChatsSettingUpdate")
+        }
     } else {
-        // Warned once centrally by `report` (see above); logging here too
-        // would emit the same fact twice.
-        AppStateDispatchOutcome::Malformed("DisableLinkPreviewsUpdate")
+        AppStateDispatchOutcome::Unclaimed
     }
 }
 
@@ -93,6 +119,31 @@ impl<'a> AppStateSettings<'a> {
             .send_app_state_action(&schemas::DISABLE_LINK_PREVIEWS, &[], &value)
             .await
     }
+
+    /// Turn auto-unarchiving of chats on or off for the whole account.
+    ///
+    /// Mirrors WA Web's `WAWebArchiveSettingSync.getMutation`: a `Set` on
+    /// the `regular_low` collection with an empty index argument list, carrying
+    /// `unarchiveChatsSetting.unarchiveChats`.
+    ///
+    /// When `true`, receiving a new message in an archived chat unarchives it
+    /// (the default WhatsApp behavior). When `false` ("Keep chats archived"),
+    /// chats stay archived when new messages arrive.
+    pub async fn set_unarchive_chats(&self, unarchive: bool) -> Result<(), AppStateError> {
+        debug!("Setting unarchiveChats -> {unarchive}");
+        let value = wa::SyncActionValue {
+            unarchive_chats_setting: buffa::MessageField::some(
+                wa::sync_action_value::UnarchiveChatsSetting {
+                    unarchive_chats: Some(unarchive),
+                },
+            ),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
+        };
+        self.client
+            .send_app_state_action(&schemas::UNARCHIVE_CHATS_SETTING, &[], &value)
+            .await
+    }
 }
 
 impl Client {
@@ -124,10 +175,17 @@ mod tests {
     }
 
     fn run(m: &Mutation) -> (AppStateDispatchOutcome, Vec<Arc<Event>>) {
+        run_with_full_sync(m, false)
+    }
+
+    fn run_with_full_sync(
+        m: &Mutation,
+        full_sync: bool,
+    ) -> (AppStateDispatchOutcome, Vec<Arc<Event>>) {
         let bus = CoreEventBus::new();
         let rec = Arc::new(Recorder::default());
         bus.subscribe_handler(rec.clone()).detach();
-        let outcome = dispatch_app_state_setting_mutation_outcome(&bus, &mut m.clone(), false);
+        let outcome = dispatch_app_state_setting_mutation_outcome(&bus, &mut m.clone(), full_sync);
         let events = rec.events.lock().unwrap().clone();
         (outcome, events)
     }
@@ -135,6 +193,14 @@ mod tests {
     fn set_mutation(value: wa::SyncActionValue) -> Mutation {
         Mutation {
             index: vec!["setting_disableLinkPreviews".into()],
+            operation: wa::syncd_mutation::SyncdOperation::Set,
+            action_value: Some(value),
+        }
+    }
+
+    fn set_unarchive_mutation(value: wa::SyncActionValue) -> Mutation {
+        Mutation {
+            index: vec!["setting_unarchiveChats".into()],
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some(value),
         }
@@ -159,8 +225,27 @@ mod tests {
     }
 
     #[test]
+    fn unarchive_chats_index_matches_wa_web() {
+        // WAWebArchiveSettingSync passes `indexArgs: []`, so the index is
+        // the bare action name.
+        let index = build_action_index(&schemas::UNARCHIVE_CHATS_SETTING, &[]).unwrap();
+        let parts: Vec<String> = serde_json::from_slice(&index).unwrap();
+        assert_eq!(parts, vec!["setting_unarchiveChats"]);
+        assert_eq!(schemas::UNARCHIVE_CHATS_SETTING.version, 4);
+        assert_eq!(
+            schemas::UNARCHIVE_CHATS_SETTING.collection,
+            schemas::Collection::RegularLow
+        );
+        assert_eq!(
+            schemas::UNARCHIVE_CHATS_SETTING.value_field,
+            Some("unarchiveChatsSetting")
+        );
+    }
+
+    #[test]
     fn index_rejects_any_argument() {
         assert!(build_action_index(&schemas::DISABLE_LINK_PREVIEWS, &["1"]).is_err());
+        assert!(build_action_index(&schemas::UNARCHIVE_CHATS_SETTING, &["1"]).is_err());
     }
 
     /// The exact bytes `set_link_previews_disabled` puts on the wire, against
@@ -201,6 +286,44 @@ mod tests {
         }
     }
 
+    /// The exact bytes `set_unarchive_chats` puts on the wire, against
+    /// `WAWebArchiveSettingSync.getMutation`.
+    #[tokio::test]
+    async fn unarchive_chats_setting_matches_wa_webs_builder_on_the_wire() {
+        let collection = crate::features::chat_actions::collection_patch_name(
+            schemas::UNARCHIVE_CHATS_SETTING.collection,
+        );
+        for unarchive in [true, false] {
+            let mutation = capture(collection.as_str(), move |client| async move {
+                client
+                    .app_state_settings()
+                    .set_unarchive_chats(unarchive)
+                    .await
+            })
+            .await;
+            assert_eq!(mutation.index, vec!["setting_unarchiveChats"]);
+            assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::Set);
+            assert_eq!(
+                mutation
+                    .action_value
+                    .as_ref()
+                    .and_then(|v| v.unarchive_chats_setting.as_option())
+                    .and_then(|a| a.unarchive_chats),
+                Some(unarchive),
+                "the flag rides on SyncActionValue.unarchiveChatsSetting"
+            );
+
+            // What we emit, a linked device must be able to hand back.
+            let (outcome, events) = run(&mutation);
+            assert!(outcome != AppStateDispatchOutcome::Unclaimed);
+            assert_eq!(events.len(), 1);
+            match &*events[0] {
+                Event::UnarchiveChatsSettingUpdate(u) => assert_eq!(u.unarchive_chats, unarchive),
+                other => panic!("expected UnarchiveChatsSettingUpdate, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn inbound_set_dispatches_the_flag() {
         for disabled in [true, false] {
@@ -227,6 +350,34 @@ mod tests {
     }
 
     #[test]
+    fn inbound_set_dispatches_unarchive_chats_flag() {
+        for full_sync in [true, false] {
+            for unarchive in [true, false] {
+                let m = set_unarchive_mutation(wa::SyncActionValue {
+                    unarchive_chats_setting: buffa::MessageField::some(
+                        wa::sync_action_value::UnarchiveChatsSetting {
+                            unarchive_chats: Some(unarchive),
+                        },
+                    ),
+                    timestamp: Some(1000),
+                    ..Default::default()
+                });
+                let (outcome, events) = run_with_full_sync(&m, full_sync);
+                assert!(outcome != AppStateDispatchOutcome::Unclaimed);
+                assert_eq!(events.len(), 1);
+                match &*events[0] {
+                    Event::UnarchiveChatsSettingUpdate(u) => {
+                        assert_eq!(u.unarchive_chats, unarchive);
+                        assert_eq!(u.from_full_sync, full_sync);
+                        assert_eq!(u.action.unarchive_chats, Some(unarchive));
+                    }
+                    other => panic!("expected UnarchiveChatsSettingUpdate, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn absent_flag_is_claimed_but_not_dispatched() {
         // WA Web logs it as a malformed action value and applies nothing; an
         // event with a made-up default would be worse than none.
@@ -234,6 +385,21 @@ mod tests {
             privacy_setting_disable_link_previews_action: buffa::MessageField::some(
                 wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction {
                     is_previews_disabled: None,
+                },
+            ),
+            ..Default::default()
+        });
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn absent_unarchive_chats_flag_is_claimed_but_not_dispatched() {
+        let m = set_unarchive_mutation(wa::SyncActionValue {
+            unarchive_chats_setting: buffa::MessageField::some(
+                wa::sync_action_value::UnarchiveChatsSetting {
+                    unarchive_chats: None,
                 },
             ),
             ..Default::default()
